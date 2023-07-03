@@ -1,5 +1,7 @@
 package io.fullstackdeveloper.lambda
 
+import io.fullstackdeveloper.lambda.Stream.Companion.cons
+import io.fullstackdeveloper.lambda.Stream.Companion.empty
 import java.time.LocalDateTime
 
 // Pure functions
@@ -207,6 +209,8 @@ fun <A> zipWith(xa: List<A>, xb: List<A>, f: (A, A) -> A): List<A> = when (xa) {
     }
 }
 
+fun <A> reverse(xs: List<A>): List<A> = foldLeft(xs, List.empty()) { t: List<A>, h: A -> Cons(h, t) }
+
 /*
     val values = List.of(1, 2, 3, 4, 5)
     println(sum(values))
@@ -244,6 +248,7 @@ fun <A> maxDepthF(tree: Tree<A>) = fold(tree, { 0 }, { b1, b2 -> 1 + maxOf(b1, b
 fun <A, B> mapF(tree: Tree<A>, f: (A) -> B) =
     fold(tree, { a: A -> Leaf(f(a)) }, { b1: Tree<B>, b2: Tree<B> -> Branch(b1, b2) })
 
+// Handling errors without exceptions
 sealed class Option<out A>
 class Some<A>(val value: A) : Option<A>()
 object None : Option<Nothing>()
@@ -265,6 +270,13 @@ fun <A> Option<A>.orElse(ob: () -> Option<A>): Option<A> = map { Some(it) }.getO
 fun <A> Option<A>.filter(f: (A) -> Boolean): Option<A> = flatMap { a -> if (f(a)) Some(a) else None }
 
 fun getTimestamp(): Option<LocalDateTime> = None // Some(LocalDateTime.now())
+
+/*
+ val datetime = getTimestamp()
+        .map { it.year }
+        .getOrElse { LocalDateTime.MIN }
+    println(datetime)
+ */
 
 sealed class Either<out E, out A>
 data class Left<out E>(val value: E) : Either<E, Nothing>()
@@ -288,18 +300,172 @@ fun safeDiv(x: Int, y: Int): Either<String, Int> =
     }
 
 /*
- val datetime = getTimestamp()
-        .map { it.year }
-        .getOrElse { LocalDateTime.MIN }
-    println(datetime)
-
     val division = safeDiv(2, 0)
         .map(add2)
         .map(::abs)
         .orElse { Right(0) }
  */
 
+// Non-strict / lazy evaluation
+
+fun <A> lazyIf(condition: Boolean, onTrue: () -> A, onFalse: () -> A): A = if (condition) onTrue() else onFalse()
+
+/*
+    val value = 5
+    val result = lazyIf((value < 10), { println("a") }, { println("b") })
+ */
+
+sealed class Stream<out A> {
+
+    companion object {
+
+        fun <A> of(vararg xs: A): Stream<A> = if (xs.isEmpty()) empty()
+        else cons({ xs[0] }, { of(*xs.sliceArray(1 until xs.size)) })
+
+        // Memoization - prevents multiple evaluations of expensive computations by caching the result
+        fun <A> cons(hd: () -> A, tl: () -> Stream<A>): Stream<A> {
+            val head: A by lazy(hd)
+            val tail: Stream<A> by lazy(tl)
+            return LazyCons({ head }, { tail })
+        }
+
+        fun <A> empty(): Stream<A> = Empty
+
+    }
+
+    fun <B> foldRight(z: () -> B, f: (A, () -> B) -> B): B = when (this) {
+        // f is non-strict in its second parameter. If f chooses
+        // not to evaluate its second parameter, the traversal will be terminated early
+        is LazyCons -> f(this.head()) {
+            tail().foldRight(
+                z,
+                f
+            )
+        } // If f doesn’t evaluate its second argument, the recursion never occurs.
+        is Empty -> z()
+    }
+
+    fun exists(p: (A) -> Boolean): Boolean = foldRight({ false }, { a, b -> p(a) || b() })
+
+}
+
+data class LazyCons<out A>(val head: () -> A, val tail: () -> Stream<A>) : Stream<A>()
+object Empty : Stream<Nothing>()
+
+fun <A> Stream<A>.head(): Option<A> =
+    when (this) {
+        is Empty -> None
+        is LazyCons -> Some(head()) // evaluates only the head
+    }
+
+fun <A> Stream<A>.toList(): List<A> {
+    tailrec fun go(xs: Stream<A>, acc: List<A>): List<A> = when (xs) {
+        is Empty -> acc
+        is LazyCons -> go(xs.tail(), Cons(xs.head(), acc))
+    }
+    return reverse(go(this, Nil))
+}
+
+fun <A> Stream<A>.take(n: Int): Stream<A> {
+    fun go(xs: Stream<A>, n: Int): Stream<A> = when (xs) {
+        is Empty -> empty()
+        is LazyCons -> if (n == 0) empty() else cons(xs.head) { go(xs.tail(), n - 1) }
+    }
+    return go(this, n)
+}
+
+fun <A> Stream<A>.drop(n: Int): Stream<A> {
+    tailrec fun go(xs: Stream<A>, n: Int): Stream<A> = when (xs) {
+        is Empty -> empty()
+        is LazyCons -> if (n == 0) xs else go(xs.tail(), n - 1)
+    }
+    return go(this, n)
+}
+
+fun <A> Stream<A>.takeWhile(p: (A) -> Boolean): Stream<A> =
+    when (this) {
+        is Empty -> empty()
+        is LazyCons -> if (p(this.head())) cons(this.head) { this.tail().takeWhile(p) } else empty()
+    }
+
+fun <A> Stream<A>.forAll(p: (A) -> Boolean): Boolean = foldRight({ true }, { a, b -> p(a) && b() })
+
+fun <A> Stream<A>.takeWhileFr(p: (A) -> Boolean): Stream<A> =
+    foldRight({ empty() }, { h, t -> if (p(h)) cons({ h }, t) else t() })
+
+fun <A, B> Stream<A>.map(f: (A) -> B): Stream<B> = this.foldRight({ empty<B>() }, { h, t -> cons({ f(h) }, t) })
+
+fun <A> Stream<A>.filter(f: (A) -> Boolean): Stream<A> =
+    this.foldRight({ empty<A>() }, { h, t -> if (f(h)) cons({ h }, t) else t() })
+
+fun <A> Stream<A>.append(sa: () -> Stream<A>): Stream<A> = foldRight(sa) { h, t -> cons({ h }, t) }
+
+fun <A, B> Stream<A>.flatMap(f: (A) -> Stream<B>): Stream<B> = foldRight({ empty<B>() }, { h, t -> f(h).append(t) })
+
+/*
+    val stream = Stream.of(1, 2, 3, 4, 5)
+    println(stream.take(4).toList())
+ */
+
+// Infinite streams
+fun ones(): Stream<Int> = cons({ 1 }, { ones() })
+
+fun <A> constant(a: A): Stream<A> = cons({ a }, { constant(a) })
+
+fun from(n: Int): Stream<Int> = cons({ n }, { from(n + 1) })
+
+fun fibonacci(): Stream<Int> {
+    fun go(curr: Int, nxt: Int): Stream<Int> = cons({ curr }, { go(nxt, curr + nxt) })
+    return go(0, 1)
+}
+
+/*
+    println(ones().take(5).toList())
+    println(ones().exists { it % 2 != 0 })
+    println(ones().map { it + 1 }.exists { it % 2 == 0 })
+    println(ones().takeWhile { it == 1 }.take(6).toList())
+ */
+
+// General stream-building function - takes an initial state, and a function for producing
+// both the next state and the next value in the generated stream.
+// Option is used to indicate when the Stream should be terminated.
+// The unfold function is an example of a corecursive function.
+// Whereas a recursive function consumes data, a corecursive function produces data.
+// Corecursion is also sometimes called guarded recursion, and productivity is sometimes called cotermination.
+fun <A, S> unfold(z: S, f: (S) -> Option<Pair<A, S>>): Stream<A> = f(z)
+    .map { pair -> cons({ pair.first }, { unfold(pair.second, f) }) }
+    .getOrElse { empty() }
+
+fun fibonacciUf(): Stream<Int> = unfold(0 to 1) { (curr, next) -> Some(curr to (next to (curr + next))) }
+
+fun fromUf(n: Int): Stream<Int> = unfold(n) { a -> Some(a to (a + 1)) }
+
+fun <A> constantUf(n: A): Stream<A> = unfold(n) { a -> Some(a to a) }
+
+fun onesUf(): Stream<Int> = unfold(1) { Some(1 to 1) }
+
+fun <A, B> Stream<A>.mapUf(f: (A) -> B): Stream<B> = unfold(this) { s: Stream<A> ->
+    when (s) {
+        is LazyCons -> Some(f(s.head()) to s.tail())
+        else -> None
+    }
+}
+
+fun <A> Stream<A>.takeUf(n: Int): Stream<A> = unfold(this) { s: Stream<A> ->
+    when (s) {
+        is LazyCons -> if (n > 0) Some(s.head() to s.tail().take(n - 1)) else None
+        else -> None
+    }
+}
+
+fun <A> Stream<A>.takeWhileUf(p: (A) -> Boolean): Stream<A> = unfold(this) { s: Stream<A> ->
+    when (s) {
+        is LazyCons -> if (p(s.head())) Some(s.head() to s.tail()) else None
+        else -> None
+    }
+}
 
 fun main() {
+
 
 }
